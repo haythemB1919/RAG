@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 # Logging setup for debugging
 logging.basicConfig(level=logging.INFO)
 
-# Set your Cohere API key here
+# Set Cohere API key 
 API_KEY = "nEBF2bqrVJBFGWHKhQxqPU49n7ompcmuNZs5IXCr"
 COHERE_API_URL = "https://api.cohere.ai/v1/generate"
 HEADERS = {
