@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 from sentence_transformers import SentenceTransformer, util
-from transformers import BartForConditionalGeneration, BartTokenizer, AutoModelForTokenClassification, pipeline, AutoTokenizer
+from transformers import BartForConditionalGeneration, BartTokenizer
 import logging
 import torch
 from concurrent.futures import ThreadPoolExecutor
@@ -22,15 +22,16 @@ HEADERS = {
 summarizer_model = BartForConditionalGeneration.from_pretrained("facebook/bart-large-cnn")
 summarizer_tokenizer = BartTokenizer.from_pretrained("facebook/bart-large-cnn")
 
-ner_tokenizer = AutoTokenizer.from_pretrained("dbmdz/bert-large-cased-finetuned-conll03-english")
-ner_model = AutoModelForTokenClassification.from_pretrained("dbmdz/bert-large-cased-finetuned-conll03-english")
-
 # Load the embedding model for chunking
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 # Cohere prompt limit
 MAX_TOKENS = 2048  # Token limit for Cohere API
 MAX_CHUNK_TOKENS = 1200  # Allow room for the question
+
+# Clear the previous question when a new dataset is uploaded
+def clear_previous_question():
+    st.session_state["user_query"] = ""
 
 # Function to make a Cohere API request for text generation
 def ask_cohere(question, context):
@@ -62,15 +63,6 @@ def semantic_chunking(text, chunk_size=500):
         chunks.append(batch.strip())
     logging.info(f"Total chunks created: {len(chunks)}")
     return chunks
-
-# Context-enriched chunking
-def context_enriched_chunking(chunks, window_size=2):
-    logging.info("Performing context-enriched chunking...")
-    enriched_chunks = []
-    for i in range(len(chunks)):
-        context = ' '.join(chunks[max(0, i-window_size):i+1])
-        enriched_chunks.append(context)
-    return enriched_chunks
 
 # Function to find the most relevant chunk using semantic similarity with batching
 def find_relevant_chunk(question, chunks, batch_size=8):
@@ -104,7 +96,11 @@ def truncate_chunk(chunk, max_chunk_tokens=MAX_CHUNK_TOKENS):
 # Streamlit app UI
 st.title('Advanced Data Question Answering with Cohere API (NER and Summarization)')
 
-uploaded_file = st.file_uploader("Upload your data file (CSV, Excel, TXT)", type=["csv", "xlsx", "txt"])
+# Clear previous query when a new file is uploaded
+if "user_query" not in st.session_state:
+    st.session_state["user_query"] = ""
+
+uploaded_file = st.file_uploader("Upload your data file (CSV, Excel, TXT)", type=["csv", "xlsx", "txt"], on_change=clear_previous_question)
 
 if uploaded_file:
     with st.spinner('Processing uploaded file...'):
@@ -131,9 +127,7 @@ if uploaded_file:
             with st.spinner('Applying semantic chunking...'):
                 semantic_chunks = semantic_chunking(text_data, chunk_size=500)
 
-            # Apply context-enriched chunking
-            with st.spinner('Applying context-enriched chunking...'):
-                enriched_chunks = context_enriched_chunking(semantic_chunks, window_size=2)
+            enriched_chunks = semantic_chunks
 
             st.success('Text successfully chunked!')
 
@@ -141,7 +135,7 @@ if uploaded_file:
             st.error("Unsupported file type.")
 
     # Get user query
-    user_query = st.text_input("Ask a question about the uploaded file")
+    user_query = st.text_input("Ask a question about the uploaded file", key="user_query")
 
     if user_query and enriched_chunks:
         with st.spinner('Processing your query...'):
