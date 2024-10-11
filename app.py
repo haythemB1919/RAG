@@ -17,7 +17,7 @@ logging.basicConfig(
 )
 
 # Setting up the Cohere API (for asking questions and getting text summaries)
-API_KEY = "nEBF2bqrVJBFGWHKhQxqPU49n7ompcmuNZs5IXCr" 
+API_KEY = "" 
 COHERE_API_URL = "https://api.cohere.ai/v1/generate"  # The URL endpoint of the Cohere API
 HEADERS = {  
     'Authorization': f'Bearer {API_KEY}',  # Authorization token required to authenticate requests
