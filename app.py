@@ -1,151 +1,153 @@
-import streamlit as st
-import pandas as pd
-import requests
-from sentence_transformers import SentenceTransformer, util
-from transformers import BartForConditionalGeneration, BartTokenizer
-import logging
-import torch
-from concurrent.futures import ThreadPoolExecutor
+import streamlit as st  
+import pandas as pd  
+import requests  # This is used to send HTTP requests, here to the Cohere API
+from sentence_transformers import SentenceTransformer, util  # Used for text embeddings (converting text into numbers that a model can understand)
+from transformers import BartForConditionalGeneration, BartTokenizer, VisionEncoderDecoderModel, ViTFeatureExtractor, GPT2Tokenizer  # Different models and tools for summarization and image captioning
+import torch  # PyTorch, a deep learning library, used here for handling data in tensor format
+from concurrent.futures import ThreadPoolExecutor  # This allows running tasks in parallel (multi-threading)
+import pyttsx3  # A library to convert text to speech (used for audio summaries)
+import PyPDF2  # A library used to read PDF files
+import gc  # Garbage Collector, used to clean up unused memory
+import logging  # Logging is used for debugging and keeping track of events in the program
 
-# Logging setup for debugging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s [%(levelname)s] %(message)s",  # Defines the format of the log messages
+    handlers=[logging.StreamHandler()]  # Send the log messages to the console
+)
 
-# Set Cohere API key 
-API_KEY = "nEBF2bqrVJBFGWHKhQxqPU49n7ompcmuNZs5IXCr"
-COHERE_API_URL = "https://api.cohere.ai/v1/generate"
-HEADERS = {
-    'Authorization': f'Bearer {API_KEY}',
-    'Content-Type': 'application/json'
+# Setting up the Cohere API (for asking questions and getting text summaries)
+API_KEY = "nEBF2bqrVJBFGWHKhQxqPU49n7ompcmuNZs5IXCr" 
+COHERE_API_URL = "https://api.cohere.ai/v1/generate"  # The URL endpoint of the Cohere API
+HEADERS = {  
+    'Authorization': f'Bearer {API_KEY}',  # Authorization token required to authenticate requests
+    'Content-Type': 'application/json'  # The content type of the request is JSON
 }
 
-# Load models for summarization, NER, and semantic chunking
-summarizer_model = BartForConditionalGeneration.from_pretrained("facebook/bart-large-cnn")
-summarizer_tokenizer = BartTokenizer.from_pretrained("facebook/bart-large-cnn")
 
-# Load the embedding model for chunking
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+summarizer_model = BartForConditionalGeneration.from_pretrained("facebook/bart-large-cnn")  # A pre-trained model for summarizing text
+summarizer_tokenizer = BartTokenizer.from_pretrained("facebook/bart-large-cnn")  # Tokenizer to convert text into tokens for the BART model
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')  # A pre-trained model used to create sentence embeddings (convert text to numbers)
 
-# Cohere prompt limit
-MAX_TOKENS = 2048  # Token limit for Cohere API
-MAX_CHUNK_TOKENS = 1200  # Allow room for the question
 
-# Clear the previous question when a new dataset is uploaded
+# Caching the embeddings (to avoid recalculating them each time)
+chunk_embedding_cache = {}  # Dictionary to store the embeddings for chunks of text, so we don't need to calculate them again
+
+# Clears the previous question when a new file is uploaded
 def clear_previous_question():
-    st.session_state["user_query"] = ""
+    st.session_state["user_query"] = ""  # Resets the user's question
 
-# Function to make a Cohere API request for text generation
-def ask_cohere(question, context):
-    logging.info(f"Asking Cohere: {question[:50]} with context: {context[:50]}...")
+# Function to ask a question to the Cohere API and get a text summary as the answer
+def ask_cohere(question, context, length="Brief"):
+    # Sets the number of tokens (words) in the response based on the length (Brief, Detailed, Comprehensive)
+    max_tokens = 100 if length == "Brief" else 300 if length == "Detailed" else 800  
+    # The data we send to the Cohere API
     payload = {
-        "model": "command-xlarge-nightly",
-        "prompt": f"Question: {question}\nContext: {context}",
-        "max_tokens": 200  # Limit response size
+        "model": "command-xlarge-nightly",  
+        "prompt": f"Question: {question}\nContext: {context}",  
+        "max_tokens": max_tokens  
     }
-    response = requests.post(COHERE_API_URL, headers=HEADERS, json=payload)
-    if response.status_code == 200:
-        return response.json()["generations"][0]["text"]
-    else:
-        return f"Error: {response.status_code}, {response.text}"
+    try:
+        response = requests.post(COHERE_API_URL, headers=HEADERS, json=payload)  # Sending the data to the API
+        response.raise_for_status()  # This will raise an error if the request fails
+        return response.json()["generations"][0]["text"]  # Extracting the generated text from the API response
+    except Exception as e:
+        logging.error(f"Error in Cohere API request: {e}")  # Logs an error message if something goes wrong
+        return f"Error: {e}"  # Returns an error message to display
 
-# Function for semantic chunking using sentence embeddings
+# Function to divide large text into smaller chunks 
 def semantic_chunking(text, chunk_size=500):
-    logging.info("Performing semantic chunking...")
-    sentences = text.split('. ')
-    chunks = []
-    batch = ""
-    for sentence in sentences:
+    logging.info("Performing semantic chunking...")  
+    sentences = text.split('. ')  # Splits the text into sentences (based on ". ")
+    chunks = []  # List to store chunks of text
+    batch = ""  # This will hold the current chunk we are working on
+    for sentence in sentences:  # Loop through each sentence
+        # Add the sentence to the current batch if it's small enough
         if len(batch.split()) + len(sentence.split()) <= chunk_size:
-            batch += sentence + '. '
+            batch += sentence + '. '  # Add the sentence and a period to the batch
         else:
-            chunks.append(batch.strip())
-            batch = sentence + '. '
-    if batch:
+            chunks.append(batch.strip())  # If the batch is full, add it to the chunks list
+            batch = sentence + '. '  # Start a new batch with the current sentence
+    if batch:  # If there's still some leftover batch after the loop, add it to the chunks
         chunks.append(batch.strip())
-    logging.info(f"Total chunks created: {len(chunks)}")
-    return chunks
+    logging.info(f"Total chunks created: {len(chunks)}")  # Log how many chunks were created
+    return chunks  # Return the list of chunks
 
-# Function to find the most relevant chunk using semantic similarity with batching
-def find_relevant_chunk(question, chunks, batch_size=8):
-    logging.info(f"Finding relevant chunk for question: {question[:50]}")
-    question_embedding = embedding_model.encode(question, convert_to_tensor=True)
-    
-    # Encode all chunks in parallel
-    with ThreadPoolExecutor() as executor:
-        chunk_embeddings = list(executor.map(lambda chunk: embedding_model.encode(chunk, convert_to_tensor=True), chunks))
+# Function to find the chunk of text most relevant to the user's question
+def find_relevant_chunk_with_cache(question, chunks):
+    logging.info(f"Finding relevant chunk for question: {question[:50]}...")  # Log the start of this process
+    question_embedding = embedding_model.encode(question, convert_to_tensor=True)  # Convert the question into an embedding (vector of numbers)
 
-    # Calculate cosine similarity for all chunks at once
+    chunk_embeddings = []  # List to store embeddings for each chunk of text
+    for chunk in chunks:  # Loop through each chunk
+        if chunk in chunk_embedding_cache:  # Check if we already have the embedding for this chunk in the cache
+            chunk_embeddings.append(chunk_embedding_cache[chunk])  # If so, use the cached embedding
+        else:
+            chunk_embedding = embedding_model.encode(chunk, convert_to_tensor=True)  # Otherwise, create a new embedding for the chunk
+            chunk_embedding_cache[chunk] = chunk_embedding  # Save the new embedding to the cache
+            chunk_embeddings.append(chunk_embedding)  # Add it to the list
+
+    # Calculate the similarity between the question and each chunk, and return the most similar chunk
     similarities = util.pytorch_cos_sim(question_embedding, torch.stack(chunk_embeddings))
-    
-    # Find the best chunk by identifying the highest similarity score
-    best_score = torch.max(similarities).item()
-    best_chunk_idx = torch.argmax(similarities).item()
+    best_chunk_idx = torch.argmax(similarities).item()  # Find the index of the most similar chunk
+    best_chunk = chunks[best_chunk_idx]  # Get the corresponding chunk of text
+    return best_chunk  # Return the best-matching chunk
 
-    best_chunk = chunks[best_chunk_idx]
-    logging.info(f"Best chunk score: {best_score}")
-    return best_chunk
+# Function to make sure the chunk isn't too long for the Cohere API
+def truncate_chunk(chunk, max_chunk_tokens=1200):
+    tokens = chunk.split()  # Split the chunk into words (tokens)
+    if len(tokens) > max_chunk_tokens:  # If it's too long, trim it down
+        truncated_chunk = ' '.join(tokens[:max_chunk_tokens])  # Join the first 1200 tokens back into a string
+        logging.info("Truncating chunk to fit token limit")  # Log that we truncated the chunk
+        return truncated_chunk  # Return the truncated chunk
+    return chunk  # If the chunk is already short enough, return it as-is
 
-# Truncate chunk to fit within Cohere API token limit
-def truncate_chunk(chunk, max_chunk_tokens=MAX_CHUNK_TOKENS):
-    tokens = chunk.split()  # Simple tokenization
-    if len(tokens) > max_chunk_tokens:
-        truncated_chunk = ' '.join(tokens[:max_chunk_tokens])
-        logging.info("Truncating chunk to fit token limit")
-        return truncated_chunk
-    return chunk
 
-# Streamlit app UI
-st.title('Advanced Data Question Answering with Cohere API (NER and Summarization)')
 
-# Clear previous query when a new file is uploaded
-if "user_query" not in st.session_state:
-    st.session_state["user_query"] = ""
+# Function to clean up resources (free up memory)
+def cleanup_resources():
+    logging.info("Cleaning up resources...")  # Log that cleanup is happening
+    gc.collect()  # Manually run garbage collection (clean up unused memory)
 
-uploaded_file = st.file_uploader("Upload your data file (CSV, Excel, TXT)", type=["csv", "xlsx", "txt"], on_change=clear_previous_question)
+# This is where the app starts, allowing users to upload a file
+uploaded_file = st.file_uploader("Upload your data file (CSV, Excel, TXT, PDF)", type=["csv", "xlsx", "txt", "pdf"], on_change=clear_previous_question)
 
 if uploaded_file:
-    with st.spinner('Processing uploaded file...'):
-        if uploaded_file.type == 'text/csv':
-            df = pd.read_csv(uploaded_file)
-            st.write("CSV File Uploaded Successfully:")
-            st.write(df.head())
-            context = df.to_string(index=False)
-            enriched_chunks = [context]  # Treat the whole CSV content as a single chunk
+    try:
+        dataset_name = uploaded_file.name
+        context = ""
 
-        elif uploaded_file.type == 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':
-            df = pd.read_excel(uploaded_file)
-            st.write("Excel File Uploaded Successfully:")
-            st.write(df.head())
-            context = df.to_string(index=False)
-            enriched_chunks = [context]  # No chunking needed for Excel files
+        # Process based on file type
+        if uploaded_file.type in ['text/csv', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet']:
+            df = pd.read_csv(uploaded_file) if uploaded_file.type == 'text/csv' else pd.read_excel(uploaded_file)
+            st.write(df.head())  # Show the first few rows of the data
+            context = df.to_string(index=False)  # Convert the data to a string for processing
+        elif uploaded_file.type == 'text/plain':
+            context = uploaded_file.read().decode('utf-8')  # Read and decode the text file
+            st.write(context[:500])  # Show the first 500 characters of the text
+        elif uploaded_file.type == "application/pdf":
+            pdf_reader = PyPDF2.PdfReader(uploaded_file)  # Initialize the PDF reader
+            context = "".join([page.extract_text() for page in pdf_reader.pages])  # Extract text from all pages
+            st.write(context[:500])  # Show the first 500 characters of the PDF text
 
-        elif uploaded_file.type == 'text/plain':  # Handling text files
-            text_data = uploaded_file.read().decode('utf-8')
-            st.write("Text File Content Uploaded:")
-            context = text_data
+        # Get user input for question and response length
+        response_length = st.sidebar.selectbox("Select Response Length", ["Brief", "Detailed", "Comprehensive"])
+        user_question = st.text_input("Ask a question about the uploaded file", key="user_query")
 
-            # Apply semantic chunking
-            with st.spinner('Applying semantic chunking...'):
-                semantic_chunks = semantic_chunking(text_data, chunk_size=500)
+        if user_question:
+            with st.spinner('Processing your query...'):
+                # Split text into smaller chunks and find the most relevant one
+                relevant_chunk = find_relevant_chunk_with_cache(user_question, semantic_chunking(context))
+                truncated_chunk = truncate_chunk(relevant_chunk)
+                # Get a summary from Cohere API
+                summary = ask_cohere(user_question, truncated_chunk, response_length)
+                st.write("### Answer")
+                st.write(summary)
 
-            enriched_chunks = semantic_chunks
+             
 
-            st.success('Text successfully chunked!')
+            # Clean up resources after processing
+            cleanup_resources()
 
-        else:
-            st.error("Unsupported file type.")
-
-    # Get user query
-    user_query = st.text_input("Ask a question about the uploaded file", key="user_query")
-
-    if user_query and enriched_chunks:
-        with st.spinner('Processing your query...'):
-            relevant_chunk = find_relevant_chunk(user_query, enriched_chunks)
-
-            # Truncate the chunk to fit within token limits
-            truncated_chunk = truncate_chunk(relevant_chunk)
-
-            # Use the Cohere API to get the answer
-            answer = ask_cohere(user_query, truncated_chunk)
-
-        st.write("### Answer")
-        st.write(answer)
+    except Exception as e:
+        st.error(f"Error processing file: {e}")  # Show an error message if something goes wrong
